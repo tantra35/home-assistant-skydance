@@ -63,7 +63,7 @@ async def async_setup_entry(
         cmd = PingCommand(state).raw
         await asyncio.wait_for(session.write(cmd), timeout=5)
         state.increment_frame_number()
-        _ = await session.read(64)
+        _ = await asyncio.wait_for(session.read(64), timeout=5)
     except (asyncio.TimeoutError, IOError) as e:
         raise ConfigEntryNotReady from e
 
@@ -71,18 +71,19 @@ async def async_setup_entry(
         try:
             _LOGGER.info("Getting number of zones")
             cmd = GetNumberOfZonesCommand(state).raw
-            await session.write(cmd)
+            await asyncio.wait_for(session.write(cmd), timeout=5)
             state.increment_frame_number()
-            res = await session.read(64)
+            res = await asyncio.wait_for(session.read(64), timeout=5)
             number_of_zones = GetNumberOfZonesResponse(res).number
+            _LOGGER.info("got zone count=%d(%s)", number_of_zones, res)
 
             zones = []
             for zone_num in range(1, number_of_zones + 1):
                 _LOGGER.info("Getting info about zone=%d", zone_num)
                 cmd = GetZoneInfoCommand(state, zone=zone_num).raw
-                await session.write(cmd)
+                await asyncio.wait_for(session.write(cmd), timeout=5)
                 state.increment_frame_number()
-                res = await session.read(64)
+                res = await asyncio.wait_for(session.read(64), timeout=5)
                 zone_info = GetZoneInfoResponse(res)
                 _LOGGER.debug(
                     "Zone=%d has type=%s, name=%s",
@@ -94,6 +95,9 @@ async def async_setup_entry(
                     {"num": zone_num, "name": zone_info.name, "type": zone_info.type}
                 )
             return zones
+
+        except asyncio.TimeoutError as e:
+            raise ConfigEntryNotReady from e
 
         except (IOError, ValueError) as e:
             # IOError can hardly happen when Session is too resilient...
@@ -173,7 +177,7 @@ class Zone(CoordinatorEntity, LightEntity, RestoreEntity):
         self._zone_type = zone_type
         self._zone_name = zone_name
 
-        self._is_on = None
+        self._is_on = False
 
     @property
     def name(self):
@@ -238,20 +242,65 @@ class Zone(CoordinatorEntity, LightEntity, RestoreEntity):
     async def _turn_on(self):
         _LOGGER.debug("Powering on zone=%s", self.unique_id)
         cmd = PowerOnCommand(self._state, zone=self._zone_num).raw
-        await self._session.write(cmd)
-        self._state.increment_frame_number()
-        _ = await self._session.read(64)
-        self._is_on = True
+
+        for _ in range(3):
+            try:
+                await asyncio.wait_for(self._session.write(cmd), timeout=5)
+                self._state.increment_frame_number()
+                await asyncio.wait_for(self._session.read(64), timeout=5)
+
+                self._is_on = True
+                break
+
+            except asyncio.TimeoutError:
+                await self._session.close()
+
+        else:
+            _LOGGER.error("Failed to power on zone=%s with unique_id=%s", self._zone_num, self.unique_id)
+
+    async def async_turn_off(self, **kwargs):
+        await self._turn_off()
+        self.async_write_ha_state()
+
+    async def _turn_off(self):
+        _LOGGER.debug("Powering off zone=%s", self.unique_id)
+        cmd = PowerOffCommand(self._state, zone=self._zone_num).raw
+
+        for _ in range(3):
+            try:
+                await asyncio.wait_for(self._session.write(cmd), timeout=5)
+                self._state.increment_frame_number()
+                await asyncio.wait_for(self._session.read(64), timeout=5)
+
+                self._is_on = False
+                break
+
+            except asyncio.TimeoutError:
+                await self._session.close()
+
+        else:
+            _LOGGER.error("Failed to power off zone=%s with unique_id=%s", self._zone_num, self.unique_id)
 
     async def _set_brightness(self, brightness: int):
         _LOGGER.debug("Setting brightness=%d for zone=%s", brightness, self.unique_id)
         cmd = BrightnessCommand(
             self._state, zone=self._zone_num, brightness=brightness
         ).raw
-        await self._session.write(cmd)
-        self._state.increment_frame_number()
-        _ = await self._session.read(64)
-        self._attr_brightness = brightness
+
+        for _ in range(3):
+            try:
+                await asyncio.wait_for(self._session.write(cmd), timeout=5)
+                self._state.increment_frame_number()
+                await asyncio.wait_for(self._session.read(64), timeout=5)
+
+                self._attr_brightness = brightness
+                break
+
+            except asyncio.TimeoutError:
+                await self._session.close()
+
+        else:
+            _LOGGER.error("Failed to set brightness for zone=%s with unique_id=%s", self._zone_num, self.unique_id)
 
     async def _set_color_temp(self, color_temp: int):
         _LOGGER.debug("Setting color_temp=%d for zone=%s", color_temp, self.unique_id)
@@ -321,18 +370,6 @@ class Zone(CoordinatorEntity, LightEntity, RestoreEntity):
                 / temp_range
             )
         )
-
-    async def async_turn_off(self, **kwargs):
-        await self._turn_off()
-        self.async_write_ha_state()
-
-    async def _turn_off(self):
-        _LOGGER.debug("Powering off zone=%s", self.unique_id)
-        cmd = PowerOffCommand(self._state, zone=self._zone_num).raw
-        await self._session.write(cmd)
-        self._state.increment_frame_number()
-        _ = await self._session.read(64)
-        self._is_on = False
 
     def turn_on(self, **kwargs):
         # we do not support non-async API
